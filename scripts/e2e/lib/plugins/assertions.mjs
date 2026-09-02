@@ -2,13 +2,17 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { readBoundedResponseText } from "../bounded-response-text.mjs";
+import {
+  createBoundedResponseTooLargeError,
+  readBoundedResponseText,
+} from "../../../lib/bounded-response.mjs";
 import { readPositiveIntEnv } from "../env-limits.mjs";
 import {
   readPluginInstallIndex,
   readPluginInstallRecords,
   writePluginInstallIndexForE2E,
 } from "../plugin-index-sqlite.mjs";
+import { isExplicitPluginDisableMarker } from "../plugin-uninstall-assertions.mjs";
 import { readTextFileTail } from "../text-file-utils.mjs";
 
 const command = process.argv[2];
@@ -156,8 +160,8 @@ function assertPluginRemoved(params) {
   }
 
   const config = readOpenClawConfig();
-  if (config.plugins?.entries?.[params.pluginId]) {
-    throw new Error(`${params.pluginId} config entry still present after uninstall`);
+  if (!isExplicitPluginDisableMarker(config, params.pluginId)) {
+    throw new Error(`${params.pluginId} exact disabled uninstall marker missing`);
   }
   if ((config.plugins?.allow || []).includes(params.pluginId)) {
     throw new Error(`${params.pluginId} allowlist entry still present after uninstall`);
@@ -729,6 +733,11 @@ function assertPluginFileRemoved() {
 
 function assertNpmPluginRemoved() {
   const installPath = fs.readFileSync(scratchFile("plugins-npm-install-path.txt"), "utf8").trim();
+  const packageParent = path.dirname(installPath);
+  const nodeModulesPath = path.basename(packageParent).startsWith("@")
+    ? path.dirname(packageParent)
+    : packageParent;
+  const projectRoot = path.dirname(nodeModulesPath);
   const dependencyPackagePath = fs
     .readFileSync(scratchFile("plugins-npm-dependency-path.txt"), "utf8")
     .trim();
@@ -743,6 +752,26 @@ function assertNpmPluginRemoved() {
     throw new Error(
       `npm managed dependency still exists after uninstall: ${dependencyPackagePath}`,
     );
+  }
+  if (fs.existsSync(projectRoot)) {
+    throw new Error(`npm managed project still exists after uninstall: ${projectRoot}`);
+  }
+}
+
+function assertNpmPluginRetained() {
+  const installPath = fs.readFileSync(scratchFile("plugins-npm-install-path.txt"), "utf8").trim();
+  const dependencyPackagePath = fs
+    .readFileSync(scratchFile("plugins-npm-dependency-path.txt"), "utf8")
+    .trim();
+  assertPluginRemoved({
+    pluginId: "demo-plugin-npm",
+    listFile: scratchFile("plugins-npm-retained.json"),
+  });
+  if (!fs.existsSync(installPath)) {
+    throw new Error(`npm managed package was deleted by --keep-files: ${installPath}`);
+  }
+  if (!fs.existsSync(dependencyPackagePath)) {
+    throw new Error(`npm managed dependency was deleted by --keep-files: ${dependencyPackagePath}`);
   }
 }
 
@@ -864,7 +893,7 @@ async function assertClawHubPreflight() {
           response,
           `ClawHub package preflight response for ${packageName}`,
           limits.bodyMaxBytes,
-          timeoutPromise,
+          { createTooLargeError: createBoundedResponseTooLargeError, timeoutPromise },
         ),
     );
     throw new Error(
@@ -879,7 +908,7 @@ async function assertClawHubPreflight() {
         response,
         `ClawHub package preflight response for ${packageName}`,
         limits.bodyMaxBytes,
-        timeoutPromise,
+        { createTooLargeError: createBoundedResponseTooLargeError, timeoutPromise },
       ),
   );
   const detail = await withTimeout(
@@ -983,8 +1012,8 @@ function assertClawHubRemoved() {
   const configAfterUninstall = fs.existsSync(configAfterUninstallPath)
     ? readJson(configAfterUninstallPath)
     : {};
-  if (configAfterUninstall.plugins?.entries?.[pluginId]) {
-    throw new Error(`ClawHub config entry still present after uninstall: ${pluginId}`);
+  if (!isExplicitPluginDisableMarker(configAfterUninstall, pluginId)) {
+    throw new Error(`ClawHub exact disabled uninstall marker missing: ${pluginId}`);
   }
   if ((configAfterUninstall.plugins?.allow || []).includes(pluginId)) {
     throw new Error(`ClawHub allowlist entry still present after uninstall: ${pluginId}`);
@@ -1022,6 +1051,7 @@ const commands = {
   "plugin-file-removed": assertPluginFileRemoved,
   "plugin-npm": assertNpmPlugin,
   "plugin-npm-update": assertNpmPluginUpdateUnchanged,
+  "plugin-npm-retained": assertNpmPluginRetained,
   "plugin-npm-removed": assertNpmPluginRemoved,
   "invalid-openclaw-extensions": assertInvalidOpenClawExtensionsRejected,
   "bundle-disabled": assertClaudeBundleDisabled,

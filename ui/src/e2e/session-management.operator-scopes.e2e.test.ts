@@ -1,8 +1,8 @@
 import { expect, it } from "vitest";
+import { createControlUiSessionRow as sessionRow } from "../test-helpers/control-ui-session-fixtures.ts";
 import {
   createSessionManagementE2eSuite,
   installMockGateway,
-  sessionRow,
   sessionsListResponse,
 } from "./session-management.test-support.ts";
 
@@ -13,6 +13,14 @@ const archived = sessionRow(
   Date.parse("2026-08-01T12:00:00.000Z"),
   { archived: true },
 );
+
+async function confirmDelete(page: import("playwright").Page) {
+  await page
+    .locator("openclaw-modal-dialog")
+    .last()
+    .getByRole("button", { name: "Delete", exact: true })
+    .click();
+}
 
 async function openArchivedPage(operatorScopes: string[]) {
   const context = await suite.browser.newContext({
@@ -43,9 +51,9 @@ suite.define(() => {
       "operator.write",
     ]);
     try {
-      page.on("dialog", (dialog) => void dialog.accept());
       await expect.poll(() => deleteAll.isEnabled()).toBe(true);
       await deleteAll.click();
+      await confirmDelete(page);
 
       await expect(gateway.waitForRequest("sessions.delete")).resolves.toMatchObject({
         params: {
