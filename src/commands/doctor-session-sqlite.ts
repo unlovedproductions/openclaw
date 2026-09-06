@@ -1037,15 +1037,17 @@ async function archiveLegacyArtifacts(
             move.kind === "transcript" ? fingerprint : undefined,
           ),
           classification:
-            complete && move.kind === "transcript"
-              ? imports.some((record) => record?.recovery?.repaired)
+            complete && (move.kind === "transcript" || move.kind === "trajectory")
+              ? move.kind === "transcript" && imports.some((record) => record?.recovery?.repaired)
                 ? "repair-original"
                 : "imported"
               : "protected",
           reason:
             complete && move.kind === "transcript"
               ? "verified-import-original"
-              : "unimported-or-unknown-history",
+              : complete && move.kind === "trajectory"
+                ? "verified-import-sidecar"
+                : "unimported-or-unknown-history",
           dependencies: [],
           disposal: { state: "retained" },
         };

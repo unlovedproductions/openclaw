@@ -275,10 +275,15 @@ ownership, file identity, or dependency checks. Applicable flags (`--dry-run`,
 are rejected.
 
 Only owner-recorded recovery artifacts with complete import evidence are
-eligible. Unknown or unimported history, malformed inputs, trajectories,
-forensic corrupt databases, operator backups, and unmanifested artifacts stay
-protected. Old manifests are verified offline where possible; missing evidence
-is a reason to retain an artifact. Cleanup has no automatic expiration policy.
+eligible. That includes completed-import trajectory sidecars and last copies of
+sessions that no longer exist in SQLite when offline verification can prove the
+import or the full absence. Unknown or unreferenced history, malformed inputs,
+live sessions whose archived content no longer matches SQLite, forensic corrupt
+databases, operator backups, and unmanifested artifacts stay protected. Old
+manifests are verified offline where possible; `--dry-run` does not open
+databases, so historical artifacts without producer proof stay listed as
+verification-required until apply. Missing or mismatched evidence is a reason
+to retain an artifact. Cleanup has no automatic expiration policy.
 
 The JSON result contains `stateDir`, `status`, `artifacts`, and `totals`. Each
 artifact reports its path, run ids, logical bytes, outcome, and reason. Totals

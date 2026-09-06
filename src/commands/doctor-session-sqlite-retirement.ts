@@ -103,16 +103,16 @@ export async function retireSessionSqliteRecovery(params: {
                 move: ref.move,
                 env: params.env,
               });
-              if (!artifact) {
-                throw new Error("historical-import-proof-unavailable");
-              }
               adoptions.set(ref, artifact);
             }
             item.outcome = "candidate";
-            item.reason = "verified-historical-import";
+            item.reason = adoptions.get(refs[0]!)?.reason ?? "verified-historical-import";
           } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
             item.outcome = "protected";
-            item.reason = "historical-import-proof-unavailable";
+            item.reason = message.startsWith("historical-import-")
+              ? message
+              : "historical-import-proof-unavailable";
             item.detail = String(error);
           }
         }
