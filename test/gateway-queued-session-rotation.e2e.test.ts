@@ -1,10 +1,12 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ChatPendingInputsPage } from "../packages/gateway-protocol/src/index.js";
 import type { OpenClawConfig } from "../src/config/types.openclaw.js";
 import { GatewayChatClient } from "../src/tui/gateway-chat.js";
+import { writeOpenAiResponsesText } from "./helpers/openai-responses-sse.js";
 import {
   createOpenClawTestInstance,
   type OpenClawTestInstance,
@@ -44,54 +46,46 @@ async function readJsonRequest(req: IncomingMessage): Promise<Record<string, unk
   return body ? (JSON.parse(body) as Record<string, unknown>) : {};
 }
 
-function writeResponse(res: ServerResponse, text: string): void {
-  const messageId = "msg_queued_rotation";
-  const message = {
-    type: "message",
-    id: messageId,
-    role: "assistant",
-    status: "completed",
-    content: [{ type: "output_text", text, annotations: [] }],
-  };
-  const events = [
-    {
-      type: "response.output_item.added",
-      output_index: 0,
-      item: { ...message, status: "in_progress", content: [] },
+function createQueuedRotationConfig(fixtureDir: string, baseUrl: string): OpenClawConfig {
+  const modelRef = "queued-rotation/queued-rotation";
+  return {
+    agents: {
+      defaults: {
+        workspace: path.join(fixtureDir, "workspace"),
+        model: { primary: modelRef },
+        modelPolicy: { allow: [modelRef] },
+        models: { [modelRef]: { agentRuntime: { id: "openclaw" } } },
+        skills: [],
+        skipBootstrap: true,
+      },
+      entries: { main: { model: { primary: modelRef }, skills: [] } },
     },
-    {
-      type: "response.output_text.delta",
-      item_id: messageId,
-      output_index: 0,
-      content_index: 0,
-      delta: text,
-    },
-    {
-      type: "response.output_text.done",
-      item_id: messageId,
-      output_index: 0,
-      content_index: 0,
-      text,
-    },
-    { type: "response.output_item.done", output_index: 0, item: message },
-    {
-      type: "response.completed",
-      response: {
-        id: "resp_queued_rotation",
-        status: "completed",
-        output: [message],
-        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    tools: { profile: "minimal" },
+    models: {
+      mode: "replace",
+      providers: {
+        "queued-rotation": {
+          baseUrl: `${baseUrl}/v1`,
+          apiKey: "secret-token",
+          api: "openai-responses",
+          request: { allowPrivateNetwork: true },
+          models: [
+            {
+              id: "queued-rotation",
+              name: "queued-rotation",
+              api: "openai-responses",
+              reasoning: false,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 128_000,
+              maxTokens: 4_096,
+            },
+          ],
+        },
       },
     },
-  ];
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-store",
-    connection: "keep-alive",
-  });
-  res.end(
-    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
-  );
+    messages: { queue: { mode: "followup" } },
+  };
 }
 
 async function startMockModelServer(): Promise<MockModelServer> {
@@ -116,7 +110,11 @@ async function startMockModelServer(): Promise<MockModelServer> {
           return;
         }
       }
-      writeResponse(res, requests.length === 1 ? "FIRST_TURN_COMPLETE" : "RESET_TURN_COMPLETE");
+      writeOpenAiResponsesText(res, {
+        text: requests.length === 1 ? "FIRST_TURN_COMPLETE" : "RESET_TURN_COMPLETE",
+        messageId: "msg_queued_rotation",
+        responseId: "resp_queued_rotation",
+      });
     })();
   });
   await new Promise<void>((resolve, reject) => {
@@ -199,7 +197,6 @@ describe("Gateway queued session rotation", () => {
 
       const modelServer = await startMockModelServer();
       modelServers.push(modelServer);
-      const modelRef = "queued-rotation/queued-rotation";
       const config = {
         plugins: {
           enabled: true,
@@ -213,41 +210,7 @@ describe("Gateway queued session rotation", () => {
           },
           slots: { memory: "none" },
         },
-        agents: {
-          defaults: {
-            workspace: path.join(fixtureDir, "workspace"),
-            model: { primary: modelRef },
-            models: { [modelRef]: { agentRuntime: { id: "openclaw" } } },
-            skills: [],
-            skipBootstrap: true,
-          },
-          list: [{ id: "main", default: true, model: { primary: modelRef }, skills: [] }],
-        },
-        tools: { profile: "minimal" },
-        models: {
-          mode: "replace",
-          providers: {
-            "queued-rotation": {
-              baseUrl: `${modelServer.baseUrl}/v1`,
-              apiKey: "secret-token",
-              api: "openai-responses",
-              request: { allowPrivateNetwork: true },
-              models: [
-                {
-                  id: "queued-rotation",
-                  name: "queued-rotation",
-                  api: "openai-responses",
-                  reasoning: false,
-                  input: ["text"],
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                  contextWindow: 128_000,
-                  maxTokens: 4_096,
-                },
-              ],
-            },
-          },
-        },
-        messages: { queue: { mode: "followup" } },
+        ...createQueuedRotationConfig(fixtureDir, modelServer.baseUrl),
       } satisfies OpenClawConfig;
       const instance = await createOpenClawTestInstance({
         name: "queued-session-rotation",
@@ -297,6 +260,91 @@ describe("Gateway queued session rotation", () => {
         expect(JSON.stringify(modelServer.requests[1]?.body)).toContain("OPENCLAW_E2E_AFTER_RESET");
       } finally {
         await client.abortChat({ sessionKey }).catch(() => undefined);
+        void client.stop();
+        modelServer.releaseHeldResponse();
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "stops without retrying a queued followup during shutdown",
+    async () => {
+      const fixtureDir = await mkdtemp(path.join(tmpdir(), "openclaw-followup-restart-"));
+      cleanupDirs.push(fixtureDir);
+      const modelServer = await startMockModelServer();
+      modelServers.push(modelServer);
+      const config = createQueuedRotationConfig(fixtureDir, modelServer.baseUrl);
+      const instance = await createOpenClawTestInstance({
+        name: "followup-drain-restart",
+        gatewayToken: "secret-token",
+        config,
+        env: {
+          OPENCLAW_SKIP_PROVIDERS: undefined,
+          OPENCLAW_TEST_MINIMAL_GATEWAY: undefined,
+        },
+      });
+      instances.push(instance);
+      await instance.startGateway();
+
+      const client = new GatewayChatClient({
+        url: instance.url,
+        token: "secret-token",
+      });
+      client.start();
+      await client.waitForReady();
+      const sessionKey = "agent:main:followup-drain-restart-e2e";
+      try {
+        const first = await client.sendChat({
+          sessionKey,
+          message: "OPENCLAW_E2E_HELD_BEFORE_RESTART",
+          runId: "followup-restart-held",
+        });
+        expect(first.status).toBe("started");
+        await vi.waitFor(() => expect(modelServer.requests).toHaveLength(1), WAIT_OPTS);
+
+        const second = await client.sendChat({
+          sessionKey,
+          message: "OPENCLAW_E2E_QUEUED_DURING_RESTART",
+          runId: "followup-restart-queued",
+        });
+        expect(second.status).toBe("started");
+        await vi.waitFor(async () => {
+          const history = (await client.loadHistory({ sessionKey })) as {
+            pendingInputs?: ChatPendingInputsPage;
+          };
+          expect(history.pendingInputs?.items).toEqual([
+            expect.objectContaining({
+              runId: "followup-restart-queued",
+              state: "queued",
+              queued: true,
+            }),
+          ]);
+          expect(modelServer.requests).toHaveLength(1);
+        }, WAIT_OPTS);
+
+        const child = instance.child;
+        if (!child) {
+          throw new Error("gateway child is missing");
+        }
+        child.kill("SIGTERM");
+        await vi.waitFor(
+          () => expect(instance.logs()).toContain("received SIGTERM; shutting down"),
+          WAIT_OPTS,
+        );
+        modelServer.releaseHeldResponse();
+
+        await vi.waitFor(() => {
+          const exited = child.exitCode !== null || child.signalCode !== null;
+          const drainFailures = instance.logs().match(/followup queue drain failed/g)?.length ?? 0;
+          expect(exited || drainFailures >= 2).toBe(true);
+        }, WAIT_OPTS);
+
+        const drainFailures = instance.logs().match(/followup queue drain failed/g)?.length ?? 0;
+        expect(drainFailures).toBe(0);
+        expect(modelServer.requests).toHaveLength(1);
+        expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+      } finally {
         void client.stop();
         modelServer.releaseHeldResponse();
       }

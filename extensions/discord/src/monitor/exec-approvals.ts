@@ -1,4 +1,3 @@
-// Discord plugin module implements exec approvals behavior.
 import { ButtonStyle } from "discord-api-types/v10";
 import {
   resolveApprovalOverGateway,
@@ -15,6 +14,10 @@ import {
   DISCORD_APPROVAL_ALLOWED_MENTIONS,
   formatDiscordApprovalDisplayValue,
 } from "../approval-message-safety.js";
+import {
+  discordApprovalMessageUpdates,
+  hasDiscordApprovalControl,
+} from "../approval-message-updates.js";
 import { getDiscordExecApprovalApprovers } from "../exec-approvals.js";
 import {
   Button,
@@ -25,6 +28,7 @@ import {
   type ComponentData,
   type MessagePayloadObject,
 } from "../internal/discord.js";
+import { replySilently } from "./agent-components-reply.js";
 
 type ExecApprovalButtonContext = {
   getApprovers: () => string[];
@@ -68,7 +72,7 @@ function buildTerminalPayload(params: {
       new Container(
         [
           new TextDisplay(params.applied ? "## Approval resolved" : "## Approval already resolved"),
-          new TextDisplay(`Canonical result: **${label}**`),
+          new TextDisplay(`Recorded result: **${label}**`),
           new Separator({ divider: false, spacing: "small" }),
           new TextDisplay(`-# ID: ${formatDiscordApprovalDisplayValue(approval.id)}`),
         ],
@@ -106,24 +110,20 @@ class ExecApprovalButton extends Button {
   override async run(interaction: ButtonInteraction, data: ComponentData): Promise<void> {
     const parsed = parseExecApprovalData(data);
     if (!parsed) {
-      try {
-        await interaction.reply({
-          content: "This approval is no longer valid.",
-          ephemeral: true,
-        });
-      } catch {}
+      await replySilently(interaction, {
+        content: "This approval is no longer valid.",
+        ephemeral: true,
+      });
       return;
     }
 
     const approvers = this.ctx.getApprovers();
     const userId = interaction.userId;
     if (!approvers.some((id) => id === userId)) {
-      try {
-        await interaction.reply({
-          content: "⛔ You are not authorized to approve requests.",
-          ephemeral: true,
-        });
-      } catch {}
+      await replySilently(interaction, {
+        content: "⛔ You are not authorized to approve requests.",
+        ephemeral: true,
+      });
       return;
     }
 
@@ -136,7 +136,9 @@ class ExecApprovalButton extends Button {
 
     try {
       await interaction.acknowledge();
-    } catch {}
+    } catch {
+      // A failed Discord acknowledgement must not discard an approval decision.
+    }
 
     const result = await this.ctx.resolveApproval(
       parsed.approvalId,
@@ -153,22 +155,35 @@ class ExecApprovalButton extends Button {
               : `Failed to submit approval decision for **${decisionLabel}**. The request may have expired or already been resolved.`,
           ephemeral: true,
         });
-      } catch {}
+      } catch {
+        // The Gateway result is authoritative even if Discord feedback fails.
+      }
       return;
     }
     const terminalLabel = resolveTerminalLabel(result.resolution.approval);
     let terminalized = false;
     try {
-      // Always terminalize the clicked message. Generic forwarding has no native
-      // delivery receipt, and native event/local updates may safely race.
-      await interaction.editReply(
-        buildTerminalPayload({
-          approval: result.resolution.approval,
-          applied: result.resolution.applied,
-        }),
-      );
-      terminalized = true;
-    } catch {}
+      if (interaction.message) {
+        terminalized = await discordApprovalMessageUpdates.enqueue(
+          interaction.message.id,
+          async () => {
+            // A native application update may have finished while resolution was awaited.
+            if (!hasDiscordApprovalControl(await interaction.fetchReply(), parsed)) {
+              return false;
+            }
+            await interaction.editReply(
+              buildTerminalPayload({
+                approval: result.resolution.approval,
+                applied: result.resolution.applied,
+              }),
+            );
+            return true;
+          },
+        );
+      }
+    } catch {
+      // The approval is already resolved; fall back to a separate receipt below.
+    }
     if (!terminalized || !result.resolution.applied) {
       try {
         await interaction.followUp({
@@ -177,7 +192,9 @@ class ExecApprovalButton extends Button {
             : `This approval was already resolved: ${terminalLabel}.`,
           ephemeral: true,
         });
-      } catch {}
+      } catch {
+        // Resolving an approval does not depend on delivering its receipt.
+      }
     }
   }
 }

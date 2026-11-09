@@ -184,7 +184,6 @@ test("registers pressure-prioritized Telegram menus through a real Gateway", asy
           mock = await startQaMockOpenAiServer();
           await gatewayOwner.start({
             repoRoot,
-            useRepoCli: true,
             providerBaseUrl: `${mock.baseUrl}/v1`,
             transportBaseUrl: apiRoot,
             transport: {

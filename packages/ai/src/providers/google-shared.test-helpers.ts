@@ -1,6 +1,14 @@
 // Google provider test helpers assert converted message and stream payloads.
 import { expect } from "vitest";
 import type { Model } from "../types.js";
+import { buildGoogleGenerateContentParams } from "./google-shared.js";
+
+export function convertMessages(
+  model: Parameters<typeof buildGoogleGenerateContentParams>[0],
+  context: Parameters<typeof buildGoogleGenerateContentParams>[1],
+) {
+  return buildGoogleGenerateContentParams(model, context).contents;
+}
 
 function makeZeroUsageSnapshot() {
   return {
@@ -19,7 +27,7 @@ function makeZeroUsageSnapshot() {
   };
 }
 
-export const assertRecord = (value: unknown): Record<string, unknown> => {
+const assertRecord = (value: unknown): Record<string, unknown> => {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("expected record");
   }

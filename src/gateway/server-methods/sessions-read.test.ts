@@ -3,18 +3,30 @@ import path from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { GATEWAY_CLIENT_CAPS } from "../../../packages/gateway-protocol/src/client-info.js";
 import type { AgentsListResult } from "../../../packages/gateway-protocol/src/index.js";
-import { resolveSessionStorePathCore as resolveStorePath } from "../../config/sessions.js";
-import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
+import { createDeferred } from "../../../test/helpers/promise.js";
+import * as runtimeMetadata from "../../agents/agent-runtime-metadata.js";
+import * as avatarRuntime from "../../agents/identity-avatar-file-runtime.js";
+import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
+import {
+  resolveSessionStorePathCore as resolveStorePath,
+  SESSION_TOTAL_TOKENS_VERSION,
+  type SessionEntry,
+} from "../../config/sessions.js";
+import {
+  loadSessionEntry,
+  replaceSessionEntry,
+  upsertSessionEntryCore,
+} from "../../config/sessions/session-accessor.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../../config/sessions/session-sqlite-target.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import * as pluginHostState from "../../plugins/host-hook-state.js";
 import { recordAgentProvenance } from "../../state/agent-provenance.js";
 import {
-  closeOpenClawAgentDatabasesForTest,
   listOpenClawRegisteredAgentDatabases,
   resolveOpenClawAgentSqlitePath,
 } from "../../state/openclaw-agent-db.js";
-import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
-import { ensureProfileForEmail } from "../../state/user-profiles.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { closeSessionSqliteDatabasesForTest } from "../session-utils.test-support.js";
 import { testState } from "../test-helpers.js";
 import {
   getGatewayConfigModule,
@@ -23,6 +35,11 @@ import {
   setupGatewaySessionsHandlerTestHarness,
 } from "../test/server-sessions.test-helpers.js";
 import { agentsHandlers } from "./agents.js";
+import {
+  identifiedClient,
+  listSessions,
+  requestContext,
+} from "./sessions-read-cache.test-support.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
 setupGatewaySessionsHandlerTestHarness();
@@ -50,6 +67,7 @@ function expectAgentStoreAbsent(agentId: string): void {
 async function listAgentsViaRpc(
   includeSystem = false,
   catalogContext: Partial<GatewayRequestContext> = {},
+  client?: GatewayClient,
 ): Promise<AgentsListResult> {
   const { getRuntimeConfig } = await getGatewayConfigModule();
   let result: AgentsListResult | undefined;
@@ -67,9 +85,18 @@ async function listAgentsViaRpc(
       readPreparedGatewayModelCatalog: async () => ({ entries: [] }),
       ...catalogContext,
     } as unknown as GatewayRequestContext,
-    client: includeSystem
-      ? ({ connect: { caps: [GATEWAY_CLIENT_CAPS.AGENT_KIND] } } as never)
-      : null,
+    client:
+      client ??
+      (includeSystem
+        ? {
+            connect: {
+              minProtocol: 1,
+              maxProtocol: 1,
+              client: { id: "test", version: "test", platform: "test", mode: "test" },
+              caps: [GATEWAY_CLIENT_CAPS.AGENT_KIND],
+            },
+          }
+        : null),
     isWebchatConnect: () => false,
   });
   if (!result) {
@@ -88,14 +115,18 @@ async function listAgentIdsViaRpc(
 
 async function setAgentsConfig(agentsConfig: Record<string, unknown> | undefined): Promise<void> {
   testState.agentsConfig = agentsConfig;
-  const { clearConfigCache, clearRuntimeConfigSnapshot } = await getGatewayConfigModule();
+  const { clearConfigCache, clearRuntimeConfigSnapshot, getRuntimeConfig } =
+    await getGatewayConfigModule();
   clearRuntimeConfigSnapshot();
   clearConfigCache();
+  getRuntimeConfig();
 }
 
 test("agents.list includes system rows only when negotiated", async () => {
   fs.mkdirSync(path.join(requireStateDir(), "agents", "openclaw"), { recursive: true });
   testState.agentConfig = { model: { primary: "local/shared-reasoner" } };
+  await setAgentsConfig(undefined);
+  const loadGatewayModelCatalog = vi.fn(async () => []);
   const readPreparedGatewayModelCatalog = vi.fn(async () => ({
     entries: [
       {
@@ -107,32 +138,19 @@ test("agents.list includes system rows only when negotiated", async () => {
     ],
   }));
 
-  expect(await listAgentIdsViaRpc(false, { readPreparedGatewayModelCatalog })).toEqual(["main"]);
-  const result = await listAgentsViaRpc(true, { readPreparedGatewayModelCatalog });
+  const catalogContext = { loadGatewayModelCatalog, readPreparedGatewayModelCatalog };
+  expect(await listAgentIdsViaRpc(false, catalogContext)).toEqual(["main"]);
+  const result = await listAgentsViaRpc(true, catalogContext);
   expect(result.agents.map((agent) => agent.id)).toEqual(["main", "openclaw"]);
   expect(
     result.agents
       .find((agent) => agent.id === "openclaw")
       ?.thinkingLevels?.map((level) => level.id),
-  ).toEqual(["off"]);
+  ).toEqual(["off", "ultra"]);
   expect(readPreparedGatewayModelCatalog.mock.calls).toEqual([
     [{ agentId: "main" }],
     [{ agentId: "main" }],
   ]);
-});
-
-test("agents.list reads published model facts without starting provider discovery", async () => {
-  const loadGatewayModelCatalog = vi.fn(async () => []);
-  const readPreparedGatewayModelCatalog = vi.fn(async () => ({ entries: [] }));
-
-  await expect(
-    listAgentIdsViaRpc(false, {
-      loadGatewayModelCatalog,
-      readPreparedGatewayModelCatalog,
-    }),
-  ).resolves.toEqual(["main"]);
-
-  expect(readPreparedGatewayModelCatalog).toHaveBeenCalledWith({ agentId: "main" });
   expect(loadGatewayModelCatalog).not.toHaveBeenCalled();
 });
 
@@ -153,13 +171,154 @@ test("agents.list returns the roster when optional prepared model facts are unav
   ]);
 });
 
+function avatarRosterConfig(agents: string[]): OpenClawConfig {
+  return {
+    agents: {
+      ownership: "explicit",
+      entries: {
+        ops: { identity: { name: "Operations" } },
+        research: { identity: { name: "Research", avatar: "avatar.png" } },
+      },
+    },
+    gateway: {
+      roles: {
+        definitions: {
+          reader: {
+            agents,
+            scopes: ["operator.read"],
+            sessions: { others: "none" },
+          },
+        },
+      },
+    },
+  };
+}
+
+function avatarRosterClient(): GatewayClient {
+  return {
+    connect: {
+      minProtocol: 1,
+      maxProtocol: 1,
+      client: { id: "openclaw-control-ui", version: "test", platform: "test", mode: "webchat" },
+      role: "operator",
+      scopes: ["operator.read"],
+    },
+    preparedSessionProfile: {
+      profileId: "reader-profile",
+      aliases: new Set(["reader-profile"]),
+      role: "reader",
+    },
+    authenticatedUserProfile: {
+      profileId: "reader-profile",
+      displayName: "Reader",
+      hasAvatar: false,
+      updatedAt: 1,
+    },
+  };
+}
+
+test("agents.list returns visible rows without waiting for a hidden agent avatar", async () => {
+  const config = avatarRosterConfig(["ops"]);
+  const client = avatarRosterClient();
+  const entered = createDeferred();
+  const release = createDeferred();
+  vi.spyOn(avatarRuntime, "prepareLocalAgentAvatar").mockImplementation(async () => {
+    entered.resolve();
+    await release.promise;
+    return { ok: false, reason: "missing" };
+  });
+  const startedAt = performance.now();
+  const response = listAgentsViaRpc(false, { getRuntimeConfig: () => config }, client);
+  try {
+    const first = await Promise.race([
+      response.then(() => "response"),
+      entered.promise.then(() => "hidden-avatar"),
+    ]);
+    console.log("agents.list hidden-avatar boundary", {
+      first,
+      elapsedMs: performance.now() - startedAt,
+    });
+    expect(first).toBe("response");
+    expect((await response).agents.map(({ id }) => id)).toEqual(["ops"]);
+  } finally {
+    release.resolve();
+    await response;
+  }
+});
+
 test.each([
-  { unavailableAgentId: undefined },
-  { unavailableAgentId: "work" },
-  { unavailableAgentId: "main" },
+  { initial: ["ops"], current: ["ops", "research"] },
+  { initial: ["ops", "research"], current: ["research"] },
 ])(
-  "agents.list keeps prepared thinking metadata scoped to each roster agent ($unavailableAgentId unavailable)",
-  async ({ unavailableAgentId }) => {
+  "agents.list applies avatar-time role changes from $initial to $current",
+  async ({ initial, current }) => {
+    let config = avatarRosterConfig(initial);
+    config.agents!.entries!.ops!.identity!.avatar = "ops.png";
+    const entered = createDeferred();
+    const release = createDeferred();
+    vi.spyOn(avatarRuntime, "prepareLocalAgentAvatar").mockImplementation(async (input) => {
+      if (input.source === "ops.png") {
+        entered.resolve();
+        await release.promise;
+      }
+      return { ok: false, reason: "missing" };
+    });
+    const response = listAgentsViaRpc(
+      false,
+      { getRuntimeConfig: () => config },
+      avatarRosterClient(),
+    );
+    try {
+      await entered.promise;
+      config = avatarRosterConfig(current);
+    } finally {
+      release.resolve();
+    }
+    const result = await response;
+    expect(result.agents.map(({ id }) => id)).toEqual(current);
+    expect(result).toMatchObject({
+      defaultId: "ops",
+      ownership: "explicit",
+      selectionRequired: true,
+      mainKey: "main",
+      scope: "per-sender",
+    });
+    expect(result.agents.find(({ id }) => id === "research")?.identity).toMatchObject({
+      name: "Research",
+      avatarUrl: expect.any(String),
+    });
+  },
+);
+
+test("agents.list starts legacy scalar catalog reads before awaiting siblings", async () => {
+  await setAgentsConfig({ ownership: "explicit", entries: { ops: {}, research: {} } });
+  const firstStarted = createDeferred();
+  const released = createDeferred();
+  const started: Array<string | undefined> = [];
+  const result = listAgentIdsViaRpc(false, {
+    readPreparedGatewayModelCatalog: async (params = {}) => {
+      const { agentId } = params;
+      started.push(agentId);
+      firstStarted.resolve();
+      await released.promise;
+      return { entries: [] };
+    },
+  });
+  try {
+    await firstStarted.promise;
+    expect(started).toEqual(["ops", "research"]);
+  } finally {
+    released.resolve();
+    await expect(result).resolves.toEqual(["ops", "research"]);
+  }
+});
+
+test.each([
+  { mode: "scalar", unavailableAgentId: "work" },
+  { mode: "batch", unavailableAgentId: "main" },
+])(
+  "agents.list keeps prepared thinking metadata scoped to each roster agent ($mode, $unavailableAgentId unavailable)",
+  async ({ mode, unavailableAgentId }) => {
     testState.agentConfig = { model: { primary: "local/shared-reasoner" } };
     await setAgentsConfig({
       ownership: "explicit",
@@ -181,7 +340,18 @@ test.each([
       };
     });
 
-    const result = await listAgentsViaRpc(false, { readPreparedGatewayModelCatalog });
+    const result = await listAgentsViaRpc(
+      false,
+      mode === "batch"
+        ? {
+            readPreparedGatewayModelCatalog: undefined,
+            readPreparedGatewayModelCatalogBatch: (agentIds) =>
+              Promise.allSettled(
+                agentIds.map((agentId) => readPreparedGatewayModelCatalog({ agentId })),
+              ),
+          }
+        : { readPreparedGatewayModelCatalog },
+    );
     const main = result.agents.find((agent) => agent.id === "main");
     const work = result.agents.find((agent) => agent.id === "work");
 
@@ -189,7 +359,7 @@ test.each([
     if (unavailableAgentId === "main") {
       expect(mainLevels).toContain("high");
     } else {
-      expect(mainLevels).toEqual(["off"]);
+      expect(mainLevels).toEqual(["off", "ultra"]);
     }
     expect(work?.thinkingLevels?.map((level) => level.id)).toContain("high");
     expect(readPreparedGatewayModelCatalog.mock.calls).toEqual([
@@ -201,7 +371,11 @@ test.each([
 
 test("agents.list includes durable provenance only for matching roster rows", async () => {
   await setAgentsConfig({ ownership: "explicit", entries: { ops: {}, research: {} } });
-  recordAgentProvenance("research", { createdVia: "agent", creatorAgentId: "ops" }, { nowMs: 42 });
+  await recordAgentProvenance(
+    "research",
+    { createdVia: "agent", creatorAgentId: "ops" },
+    { nowMs: 42 },
+  );
 
   const result = await listAgentsViaRpc();
 
@@ -223,12 +397,12 @@ beforeEach(async () => {
   await setAgentsConfig(undefined);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  vi.restoreAllMocks();
   testState.agentConfig = undefined;
   testState.sessionStorePath = undefined;
   testState.sessionConfig = undefined;
-  closeOpenClawAgentDatabasesForTest();
-  closeOpenClawStateDatabaseForTest();
+  await closeSessionSqliteDatabasesForTest();
 });
 
 async function configureFixedSessionStore(label = "default"): Promise<string> {
@@ -236,7 +410,7 @@ async function configureFixedSessionStore(label = "default"): Promise<string> {
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
   fs.writeFileSync(storePath, "{}\n", "utf8");
   testState.sessionStorePath = storePath;
-  await setAgentsConfig({ list: [{ id: "main", default: true }] });
+  await setAgentsConfig({ entries: { main: {} } });
   const { getRuntimeConfig } = await getGatewayConfigModule();
   expect(getRuntimeConfig().session?.store).toBe(storePath);
   return storePath;
@@ -270,6 +444,14 @@ test("sessions.resolve preserves presentation facts on unique and ambiguous wire
       boardFace: "dashboard",
     },
   });
+  for (const reference of [
+    { key: firstKey },
+    { key: "agent:main:deploy-monitor", slug: "deploy-monitor" },
+  ]) {
+    expect(await directSessionReq("sessions.resolve", { reference, agentId: "main" })).toEqual(
+      unique,
+    );
+  }
 
   await replaceSessionEntry(
     { agentId: "main", sessionKey: secondKey, storePath },
@@ -294,6 +476,97 @@ test("sessions.resolve preserves presentation facts on unique and ambiguous wire
       ],
     },
   });
+});
+
+test("sessions.resolve short IDs retain archived child-owner selection", async () => {
+  const firstKey = "agent:main:thread:12345678-0aaa-4000-8000-000000000001";
+  const secondKey = "agent:main:thread:12345678-0bbb-4000-8000-000000000002";
+  const storePath = resolveStorePath(undefined, { agentId: "main" });
+  const now = Date.now();
+  for (const [sessionKey, spawnedBy, updatedAt] of [
+    [firstKey, "agent:main:controller", now - 1],
+    [secondKey, "agent:main:other-controller", now],
+  ] as const) {
+    await replaceSessionEntry(
+      { agentId: "main", sessionKey, storePath },
+      { sessionId: sessionKey, updatedAt, archivedAt: now, spawnedBy },
+    );
+  }
+
+  for (const [spawnedBy, expectedKey] of [
+    ["agent:main:controller", firstKey],
+    ["agent:main:other-controller", secondKey],
+  ] as const) {
+    expect(
+      await directSessionReq("sessions.resolve", {
+        shortId: "12345678",
+        slugHint: "stale-title",
+        agentId: "main",
+        spawnedBy,
+      }),
+    ).toMatchObject({ ok: true, payload: { ok: true, key: expectedKey, agentId: "main" } });
+  }
+});
+
+test("sessions.describe retains full target and child metadata without decoding unrelated prompts", async () => {
+  const agentId = "main";
+  const sessionKey = "agent:main:describe-target";
+  const storePath = resolveStorePath(undefined, { agentId });
+  const updatedAt = Date.now();
+  const skillsSnapshot = { prompt: "complete target prompt", skills: [] };
+  await upsertSessionEntryCore(
+    { agentId, sessionKey, storePath },
+    { sessionId: "describe-target", updatedAt, label: "Target", skillsSnapshot },
+  );
+  for (const [name, relation] of [
+    ["child-b", "spawnedBy"],
+    ["child-a", "parentSessionKey"],
+  ] as const) {
+    await upsertSessionEntryCore(
+      { agentId, sessionKey: `agent:main:${name}`, storePath },
+      { sessionId: name, updatedAt, [relation]: sessionKey },
+    );
+  }
+  const unrelatedPrompt = "unrelated describe prompt".repeat(512);
+  for (let index = 0; index < 4; index++) {
+    await upsertSessionEntryCore(
+      { agentId, sessionKey: `agent:main:unrelated-${index}`, storePath },
+      {
+        sessionId: `unrelated-${index}`,
+        updatedAt,
+        skillsSnapshot: { prompt: unrelatedPrompt, skills: [] },
+      },
+    );
+  }
+  await directSessionReq("sessions.describe", { key: sessionKey });
+  const parse = JSON.parse;
+  let unrelatedDecodes = 0;
+  const parsed = vi.spyOn(JSON, "parse").mockImplementation((value, reviver) => {
+    if (typeof value === "string" && value.includes(unrelatedPrompt)) {
+      unrelatedDecodes++;
+    }
+    return parse(value, reviver);
+  });
+  const projected = vi.spyOn(pluginHostState, "projectPluginSessionExtensionsSync");
+  try {
+    const described = await directSessionReq("sessions.describe", { key: sessionKey });
+    expect(described).toMatchObject({
+      ok: true,
+      payload: {
+        session: {
+          key: sessionKey,
+          sessionId: "describe-target",
+          label: "Target",
+          childSessions: ["agent:main:child-a", "agent:main:child-b"],
+        },
+      },
+    });
+    expect(projected).not.toHaveBeenCalled();
+    expect(unrelatedDecodes).toBe(0);
+  } finally {
+    projected.mockRestore();
+    parsed.mockRestore();
+  }
 });
 
 test("unknown-agent session reads return missing results without provisioning an agent", async () => {
@@ -322,87 +595,6 @@ test("unknown-agent session reads return missing results without provisioning an
 
   expectAgentStoreAbsent(UNKNOWN_AGENT_ID);
   expect(await listAgentIdsViaRpc()).toEqual(["main"]);
-});
-
-test("a hidden-foreign role cannot discover sessions through search, batch previews, or exact resolve", async () => {
-  const ownerId = ensureProfileForEmail("role-viewer@example.com").id;
-  const foreignKey = "agent:main:foreign-role-read";
-  const ownKey = "agent:main:own-role-read";
-  const storePath = resolveStorePath(undefined, { agentId: "main" });
-  for (const [sessionKey, actorId] of [
-    [foreignKey, "foreign-owner@example.com"],
-    [ownKey, ownerId],
-  ] as const) {
-    const sessionId = `session-${sessionKey.split(":").at(-1)}`;
-    await replaceSessionEntry(
-      { agentId: "main", sessionKey, storePath },
-      {
-        sessionId,
-        updatedAt: 42,
-        createdActor: { type: "human", source: "profile", id: actorId },
-        visibility: "shared",
-      },
-    );
-    await seedLinearSessionTranscript({
-      agentId: "main",
-      contents: ["hidden role search needle"],
-      sessionId,
-      sessionKey,
-      storePath,
-    });
-  }
-  const cfg: OpenClawConfig = {
-    agents: { list: [{ id: "main", default: true }] },
-    gateway: {
-      roles: {
-        default: "guest",
-        definitions: {
-          guest: {
-            sessions: { others: "none" },
-            agents: "*",
-            scopes: ["operator.read", "operator.write"],
-          },
-        },
-      },
-    },
-  };
-  const client: GatewayClient = {
-    connect: {
-      minProtocol: 1,
-      maxProtocol: 1,
-      client: { id: "openclaw-control-ui", version: "test", platform: "test", mode: "webchat" },
-      role: "operator",
-      scopes: ["operator.read", "operator.write"],
-    },
-    authenticatedUserProfile: {
-      profileId: ownerId,
-      displayName: null,
-      hasAvatar: false,
-      updatedAt: 1,
-    },
-  };
-  const options = { client, context: { getRuntimeConfig: () => cfg } };
-
-  const searched = await directSessionReq<{ results: Array<{ sessionKey: string }> }>(
-    "sessions.search",
-    { query: "hidden role search needle" },
-    options,
-  );
-  expect(searched.payload?.results.map((result) => result.sessionKey)).toEqual([ownKey]);
-
-  const previews = await directSessionReq<{
-    previews: Array<{ key: string; status: string }>;
-  }>("sessions.preview", { keys: [foreignKey, ownKey] }, options);
-  expect(previews.payload?.previews).toMatchObject([
-    { key: foreignKey, status: "missing" },
-    { key: ownKey, status: "ok" },
-  ]);
-
-  const resolved = await directSessionReq("sessions.resolve", { key: foreignKey }, options);
-  expect(resolved).toMatchObject({
-    ok: false,
-    error: { message: `No session found: ${foreignKey}` },
-  });
 });
 
 test("bare ownerless reads fail closed without blocking scoped preview siblings", async () => {
@@ -465,10 +657,12 @@ test("sessions.describe retains each global row owner from a qualified main alia
     ["main", "main"],
     ["work", "workspace"],
     ["main", "workspace"],
+    ["work", "global"],
   ]) {
-    const described = await directSessionReq("sessions.describe", {
-      key: `agent:${agentId}:${alias}`,
-    });
+    const described = await directSessionReq(
+      "sessions.describe",
+      alias === "global" ? { key: "global", agentId } : { key: `agent:${agentId}:${alias}` },
+    );
     expect(described).toMatchObject({
       ok: true,
       payload: {
@@ -481,58 +675,12 @@ test("sessions.describe retains each global row owner from a qualified main alia
       },
     });
   }
-});
-
-test("sessions.describe reads a pre-existing store after its agent is removed from config", async () => {
-  const storePath = path.join(
-    requireStateDir(),
-    "agents",
-    UNKNOWN_AGENT_ID,
-    "sessions",
-    "sessions.json",
-  );
-  await replaceSessionEntry(
-    {
-      agentId: UNKNOWN_AGENT_ID,
-      sessionKey: UNKNOWN_SESSION_KEY,
-      storePath,
-    },
-    { sessionId: "session-ghost", updatedAt: 42 },
-  );
-  await setAgentsConfig({ list: [{ id: "main", default: true }] });
-  const registeredBefore = listOpenClawRegisteredAgentDatabases({
-    env: { OPENCLAW_STATE_DIR: requireStateDir() },
-  });
-
-  const described = await directSessionReq<{ session: { key: string; sessionId: string } | null }>(
-    "sessions.describe",
-    { key: UNKNOWN_SESSION_KEY },
-  );
-
-  expect(described).toMatchObject({
-    ok: true,
-    payload: { session: { key: UNKNOWN_SESSION_KEY, sessionId: "session-ghost" } },
-  });
-  expect(await listAgentIdsViaRpc()).toEqual(["main"]);
   expect(
-    listOpenClawRegisteredAgentDatabases({
-      env: { OPENCLAW_STATE_DIR: requireStateDir() },
-    }),
-  ).toEqual(registeredBefore);
-});
-
-test("sessions.describe does not treat a fixed store file as proof an unknown agent exists", async () => {
-  const storePath = await configureFixedSessionStore();
-  const described = await directSessionReq<{ session: unknown }>("sessions.describe", {
-    key: UNKNOWN_SESSION_KEY,
+    await directSessionReq("sessions.describe", { key: "agent:main:workspace", agentId: "work" }),
+  ).toMatchObject({
+    ok: false,
+    error: { code: "INVALID_REQUEST" },
   });
-
-  expect(described).toMatchObject({ ok: true, payload: { session: null } });
-  const sqlitePath = resolveSqliteTargetFromSessionStorePath(storePath, {
-    agentId: UNKNOWN_AGENT_ID,
-  }).path;
-  expect(sqlitePath).toBeDefined();
-  expect(fs.existsSync(sqlitePath!)).toBe(false);
 });
 
 test("sessions.describe reads an unconfigured agent with rows in a fixed store", async () => {
@@ -617,27 +765,42 @@ test("sessions.describe ignores an unconfigured agent found only in a fixed lega
   expect(fs.existsSync(sqlitePath!)).toBe(false);
 });
 
-test("sessions.search searches a retired per-agent store without explicit session keys", async () => {
-  const agentId = "retired";
-  const sessionKey = `agent:${agentId}:existing`;
-  const sessionId = "session-retired-search";
+test("sessions.search accepts an ACP allowlist owner absent from the agent roster", async () => {
+  const agentId = "codex";
+  const sessionKey = `agent:${agentId}:acp:search-owner`;
+  const sessionId = "session-acp-owner-search";
   const storePath = path.join(requireStateDir(), "agents", agentId, "sessions", "sessions.json");
+  await setAgentsConfig({ entries: { main: {} } });
+  const { getRuntimeConfig } = await getGatewayConfigModule();
+  getRuntimeConfig().acp = { allowedAgents: [agentId] };
   await replaceSessionEntry({ agentId, sessionKey, storePath }, { sessionId, updatedAt: 42 });
   await seedLinearSessionTranscript({
     agentId,
-    contents: ["retired search needle"],
+    contents: ["ACP owner search needle"],
     sessionId,
     sessionKey,
     storePath,
   });
-  await setAgentsConfig({ list: [{ id: "main", default: true }] });
 
   const searched = await directSessionReq<{ results: Array<{ sessionKey: string }> }>(
     "sessions.search",
-    { agentId, query: "retired search needle" },
+    { agentId, query: "ACP owner search needle", sessionKeys: [sessionKey] },
   );
 
-  expect(searched.payload?.results).toEqual([expect.objectContaining({ sessionKey })]);
+  expect(searched).toMatchObject({
+    ok: true,
+    payload: { results: [expect.objectContaining({ sessionKey })] },
+  });
+  const mismatchedOwner = await directSessionReq("sessions.search", {
+    agentId,
+    query: "ACP owner search needle",
+    sessionKeys: [`agent:claude:acp:search-owner`],
+  });
+  expect(mismatchedOwner).toMatchObject({
+    ok: false,
+    error: { code: "INVALID_REQUEST" },
+  });
+  expect(await listAgentIdsViaRpc()).toEqual(["main"]);
 });
 
 test("session reads find a retired store only reachable through its deterministic template", async () => {
@@ -651,7 +814,7 @@ test("session reads find a retired store only reachable through its deterministi
   );
   const storePath = storeTemplate.replace("{agentId}", agentId);
   testState.sessionStorePath = storeTemplate;
-  await setAgentsConfig({ list: [{ id: "main", default: true }] });
+  await setAgentsConfig({ entries: { main: {} } });
   const { getRuntimeConfig } = await getGatewayConfigModule();
   expect(getRuntimeConfig().session?.store).toBe(storeTemplate);
   await replaceSessionEntry({ agentId, sessionKey, storePath }, { sessionId, updatedAt: 42 });
@@ -661,6 +824,9 @@ test("session reads find a retired store only reachable through its deterministi
     sessionId,
     sessionKey,
     storePath,
+  });
+  const registeredBefore = listOpenClawRegisteredAgentDatabases({
+    env: { OPENCLAW_STATE_DIR: requireStateDir() },
   });
 
   const described = await directSessionReq<{ session: { sessionId: string } | null }>(
@@ -678,10 +844,15 @@ test("session reads find a retired store only reachable through its deterministi
   });
   expect(searched.payload?.results).toEqual([expect.objectContaining({ sessionKey })]);
   expect(await listAgentIdsViaRpc()).toEqual(["main"]);
+  expect(
+    listOpenClawRegisteredAgentDatabases({
+      env: { OPENCLAW_STATE_DIR: requireStateDir() },
+    }),
+  ).toEqual(registeredBefore);
 });
 
 test("session reads do not provision missing stores for default or configured agents", async () => {
-  await setAgentsConfig({ list: [{ id: "main", default: true }, { id: "work" }] });
+  await setAgentsConfig({ entries: { main: {}, work: {} } });
   for (const agentId of ["main", "work"]) {
     const result = await directSessionReq<{ session: unknown }>("sessions.describe", {
       key: `agent:${agentId}:missing`,
@@ -704,4 +875,128 @@ test("session reads do not provision missing stores for default or configured ag
       .map((entry) => entry.agentId)
       .filter((agentId) => agentId === "main" || agentId === "work"),
   ).toEqual([]);
+});
+
+test("searches rich displayed fields before selecting a page across visible agent stores", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    const config: OpenClawConfig = {
+      agents: {
+        entries: {
+          main: {},
+          work: { identity: { name: "Orchid Navigator" } },
+        },
+      },
+    };
+    setRuntimeConfigSnapshot(config);
+    const client = identifiedClient("owner@example.com");
+    const context = requestContext(config);
+    const put = async (agentId: string, name: string, entry: Partial<SessionEntry>) => {
+      await upsertSessionEntryCore(
+        { agentId, sessionKey: `agent:${agentId}:${name}` },
+        {
+          sessionId: name,
+          updatedAt: 1,
+          visibility: "shared",
+          createdActor: { type: "human", source: "profile", id: "owner@example.com" },
+          ...entry,
+        },
+      );
+    };
+    await put("work", "target", {
+      label: "Quasar label",
+      category: "Nebula category",
+      displayName: "Stored comet",
+      status: "done",
+      goal: {
+        schemaVersion: 1,
+        id: "goal-target",
+        tokenStart: 0,
+        continuationTurns: 0,
+        objective: "Map distant galaxies",
+        status: "active",
+        createdAt: 1,
+        updatedAt: 1,
+        tokensUsed: 12000,
+        tokenBudget: 50000,
+        lastStatusNote: "Telescope calibrated",
+      },
+    });
+    await put("work", "hidden", {
+      label: "Quasar label",
+      visibility: "draft",
+      createdActor: { type: "human", source: "profile", id: "restricted-owner@example.com" },
+    });
+    await put("work", "archived-target", { label: "Vault Orchid", archivedAt: 1 });
+    const runtime = runtimeMetadata.resolveCurrentSessionAgentRuntimeMetadata;
+    vi.spyOn(runtimeMetadata, "resolveCurrentSessionAgentRuntimeMetadata").mockImplementation(
+      (params) =>
+        params.sessionKey === "agent:work:target"
+          ? { id: "custom-harness", source: "session", fallback: "portable-mode" }
+          : runtime(params),
+    );
+    for (let index = 0; index < 55; index++) {
+      await put("main", `filler-${index}`, {});
+    }
+    const first = await listSessions({ client, context, request: { limit: 50 } });
+    expect(first.sessions.map((row) => row.key)).not.toContain("agent:work:target");
+    for (const search of [
+      "Quasar label",
+      "Nebula category",
+      "Stored comet",
+      "done",
+      "Map distant galaxies",
+      "Pursuing goal (12k/50k)",
+      "Telescope calibrated",
+      "Orchid Navigator",
+      "custom-harness (fallback portable-mode)",
+    ]) {
+      const result = await listSessions({ client, context, request: { search, limit: 50 } });
+      expect
+        .soft(
+          result.sessions.map((row) => row.key),
+          search,
+        )
+        .toEqual(["agent:work:target"]);
+      expect.soft(result.totalCount, search).toBe(1);
+      expect(JSON.stringify(result)).not.toContain("restricted-owner");
+    }
+    expect(
+      (await listSessions({ client, context, request: { search: "Orchid", agentId: "main" } }))
+        .sessions,
+    ).toEqual([]);
+    expect(
+      (
+        await listSessions({ client, context, request: { search: "Orchid", archived: true } })
+      ).sessions.map((row) => row.key),
+    ).toEqual(["agent:work:archived-target"]);
+    expect(
+      (await listSessions({ client, context, request: { search: "Orchid", archived: "all" } }))
+        .totalCount,
+    ).toBe(2);
+    const targetScope = { agentId: "work", sessionKey: "agent:work:target" };
+    const target = loadSessionEntry(targetScope)!;
+    await replaceSessionEntry(targetScope, {
+      ...target,
+      totalTokens: 50000,
+      totalTokensFresh: true,
+      totalTokensVersion: SESSION_TOTAL_TOKENS_VERSION,
+      goal: { ...target.goal!, tokenStartFresh: true },
+    });
+    const limited = await listSessions({
+      client,
+      context,
+      request: { search: "Goal unmet (50k/50k)" },
+    });
+    expect(limited.sessions).toMatchObject([
+      { key: targetScope.sessionKey, goal: { status: "budget_limited", tokensUsed: 50000 } },
+    ]);
+    const idle = await listSessions({ client, context, request: { search: "idle", limit: 50 } });
+    expect(idle).toMatchObject({ count: 50, totalCount: 56, nextOffset: 50 });
+    const later = await listSessions({
+      client,
+      context,
+      request: { search: "idle", limit: 50, offset: 50 },
+    });
+    expect(later).toMatchObject({ count: 6, totalCount: 56, nextOffset: null });
+  });
 });

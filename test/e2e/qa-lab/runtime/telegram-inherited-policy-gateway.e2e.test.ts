@@ -141,10 +141,8 @@ test.each(["allowlist", "open"] as const)(
               repoRoot,
               command: {
                 executablePath: process.execPath,
-                argsPrefix: [path.join(repoRoot, "scripts/run-node.mjs")],
+                argsPrefix: [path.join(repoRoot, "dist", "index.js")],
                 argsSuffix: ["--verbose"],
-                cwd: repoRoot,
-                usePackagedPlugins: true,
               },
               providerMode: "mock-openai",
               providerBaseUrl: `${mock.baseUrl}/v1`,

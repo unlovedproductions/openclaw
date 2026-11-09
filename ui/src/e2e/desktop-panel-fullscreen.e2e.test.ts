@@ -65,7 +65,10 @@ async function openDesktopPanel(page: Page) {
   await page.evaluate(() => {
     window.dispatchEvent(new CustomEvent("openclaw:command-palette-open"));
   });
-  await page.getByRole("combobox", { name: "Search chats and commands…" }).waitFor();
+  await page
+    .locator("openclaw-command-palette")
+    .getByRole("textbox", { name: "Search or start a task…" })
+    .waitFor();
   await page.getByRole("option", { name: "Desktop", exact: true }).click();
   const panel = page.locator("openclaw-desktop-panel");
   await panel.locator("section[aria-label='Desktop']").waitFor();
@@ -77,8 +80,6 @@ async function setTheme(page: Page, theme: "dark" | "light") {
   await page.evaluate((nextTheme) => {
     document.documentElement.dataset.themeMode = nextTheme;
     document.documentElement.dataset.themeResolved = nextTheme;
-    document.documentElement.classList.toggle("wa-light", nextTheme === "light");
-    document.documentElement.classList.toggle("wa-dark", nextTheme === "dark");
     document.documentElement.style.colorScheme = nextTheme;
   }, theme);
 }

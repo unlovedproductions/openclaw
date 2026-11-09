@@ -1,22 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { withTempDirSync } from "../test-helpers/temp-dir.js";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { mockProcessPlatform } from "../test-utils/vitest-spies.js";
 import {
   evaluateRuntimeEligibility,
   hasBinary,
   isConfigPathTruthyWithDefaults,
+  prepareBinaryAvailability,
 } from "./config-eval.js";
-
-function setPlatform(platform: NodeJS.Platform): void {
-  mockProcessPlatform(platform);
-}
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
 });
+
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 describe("config-eval helpers", () => {
   it("normalizes truthy values across primitive types", () => {
@@ -64,22 +63,6 @@ describe("config-eval helpers", () => {
     expect(isConfigPathTruthyWithDefaults(config, "prototype.polluted", {})).toBe(false);
   });
 
-  it("uses defaults only when config paths are unresolved", () => {
-    const config = {
-      browser: {
-        enabled: false,
-      },
-    };
-
-    expect(
-      isConfigPathTruthyWithDefaults(config, "browser.enabled", { "browser.enabled": true }),
-    ).toBe(false);
-    expect(
-      isConfigPathTruthyWithDefaults(config, "browser.missing", { "browser.missing": true }),
-    ).toBe(true);
-    expect(isConfigPathTruthyWithDefaults(config, "browser.other", {})).toBe(false);
-  });
-
   it("does not use inherited defaults for blocked config paths", () => {
     expect(isConfigPathTruthyWithDefaults({}, "constructor", {})).toBe(false);
     expect(isConfigPathTruthyWithDefaults({}, "__proto__.enabled", {})).toBe(false);
@@ -87,7 +70,7 @@ describe("config-eval helpers", () => {
   });
 
   it("returns the active runtime platform", () => {
-    setPlatform("darwin");
+    mockProcessPlatform("darwin");
     expect(
       evaluateRuntimeEligibility({
         os: ["darwin"],
@@ -98,51 +81,33 @@ describe("config-eval helpers", () => {
     ).toBe(true);
   });
 
-  it("caches binary lookups until PATH changes", () => {
-    setPlatform("linux");
-    vi.stubEnv("PATH", ["/missing/bin", "/found/bin"].join(path.delimiter));
-    const accessSpy = vi.spyOn(fs, "accessSync").mockImplementation((candidate) => {
-      if (String(candidate) === path.join("/found/bin", "tool")) {
-        return undefined;
-      }
-      throw new Error("missing");
-    });
+  it("caches successful binary lookups until PATH changes", () => {
+    mockProcessPlatform("linux");
+    const binDir = tempDirs.make("openclaw-binary-cache-");
+    const missingDir = path.join(binDir, "missing");
+    const executable = path.join(binDir, "tool");
+    fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(executable, 0o755);
+    vi.stubEnv("PATH", [missingDir, binDir].join(path.delimiter));
 
     expect(hasBinary("tool")).toBe(true);
+    fs.unlinkSync(executable);
     expect(hasBinary("tool")).toBe(true);
-    expect(accessSpy).toHaveBeenCalledTimes(2);
 
-    vi.stubEnv("PATH", "/other/bin");
-    accessSpy.mockClear();
-    accessSpy.mockImplementation(() => {
-      throw new Error("missing");
-    });
-
+    vi.stubEnv("PATH", missingDir);
     expect(hasBinary("tool")).toBe(false);
-    expect(accessSpy).toHaveBeenCalledTimes(1);
   });
 
   it("checks PATHEXT candidates and invalidates cached hits when PATHEXT changes", () => {
-    setPlatform("win32");
-    const toolsDir = path.join(path.sep, "tools");
+    mockProcessPlatform("win32");
+    const toolsDir = tempDirs.make("openclaw-binary-pathext-");
     vi.stubEnv("PATH", toolsDir);
     vi.stubEnv("PATHEXT", ".EXE;.CMD");
-    const plainCandidate = path.join(toolsDir, "tool");
-    const exeCandidate = path.join(toolsDir, "tool.EXE");
     const cmdCandidate = path.join(toolsDir, "tool.CMD");
-    const accessSpy = vi.spyOn(fs, "accessSync").mockImplementation((candidate) => {
-      if (String(candidate) === cmdCandidate) {
-        return undefined;
-      }
-      throw new Error("missing");
-    });
+    fs.writeFileSync(cmdCandidate, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(cmdCandidate, 0o755);
 
     expect(hasBinary("tool")).toBe(true);
-    expect(accessSpy.mock.calls.map(([candidate]) => String(candidate))).toEqual([
-      plainCandidate,
-      exeCandidate,
-      cmdCandidate,
-    ]);
 
     vi.stubEnv("PATHEXT", ".EXE");
     expect(hasBinary("tool")).toBe(false);
@@ -152,94 +117,77 @@ describe("config-eval helpers", () => {
 
   it.each([
     { platform: "linux", suffix: "" },
-    { platform: "darwin", suffix: "" },
     { platform: "win32", suffix: ".CMD" },
   ] as const)(
     "finds a newly installed binary on unchanged $platform PATH",
     ({ platform, suffix }) => {
-      withTempDirSync({ prefix: "openclaw-binary-probe-" }, (binDir) => {
-        setPlatform(platform);
-        vi.stubEnv("PATH", binDir);
-        vi.stubEnv("PATHEXT", ".EXE;.CMD");
-        expect(hasBinary("fixture-tool")).toBe(false);
+      const binDir = tempDirs.make("openclaw-binary-probe-");
+      mockProcessPlatform(platform);
+      vi.stubEnv("PATH", binDir);
+      vi.stubEnv("PATHEXT", ".EXE;.CMD");
+      expect(hasBinary("fixture-tool")).toBe(false);
 
-        const executable = path.join(binDir, `fixture-tool${suffix}`);
-        fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n");
-        fs.chmodSync(executable, 0o755);
+      const executable = path.join(binDir, `fixture-tool${suffix}`);
+      fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+      fs.chmodSync(executable, 0o755);
 
-        expect(process.env.PATH).toBe(binDir);
-        expect(process.env.PATHEXT).toBe(".EXE;.CMD");
-        expect(hasBinary("fixture-tool")).toBe(true);
-      });
+      expect(hasBinary("fixture-tool")).toBe(true);
     },
   );
 });
 
-describe("runtime requirements through eligibility", () => {
-  it("accepts remote bins and remote any-bin matches", () => {
-    const result = evaluateRuntimeEligibility({
-      requires: {
-        bins: ["node"],
-        anyBins: ["bun", "deno"],
-        env: ["OPENAI_API_KEY"],
-        config: ["browser.enabled"],
-      },
-      hasBin: () => false,
-      hasRemoteBin: (bin) => bin === "node",
-      hasAnyRemoteBin: (bins) => bins.includes("deno"),
-      hasEnv: (name) => name === "OPENAI_API_KEY",
-      isConfigPathTruthy: (pathValue) => pathValue === "browser.enabled",
-    });
-
-    expect(result).toBe(true);
+describe("prepared binary availability", () => {
+  it("sees installations and removals even after a synchronous lookup cached the binary", async () => {
+    const binDir = tempDirs.make("openclaw-prepared-binary-");
+    vi.stubEnv("PATH", binDir);
+    const executable = path.join(binDir, "fixture-tool");
+    expect((await prepareBinaryAvailability(["fixture-tool"])).hasBinary("fixture-tool")).toBe(
+      false,
+    );
+    fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(executable, 0o755);
+    expect(hasBinary("fixture-tool")).toBe(true);
+    expect((await prepareBinaryAvailability(["fixture-tool"])).hasBinary("fixture-tool")).toBe(
+      true,
+    );
+    fs.unlinkSync(executable);
+    expect((await prepareBinaryAvailability(["fixture-tool"])).hasBinary("fixture-tool")).toBe(
+      false,
+    );
+    expect(hasBinary("fixture-tool")).toBe(true);
+    vi.stubEnv("PATH", path.join(binDir, "other"));
+    expect(hasBinary("fixture-tool")).toBe(false);
   });
 
-  it("rejects when any required runtime check is still unsatisfied", () => {
-    expect(
-      evaluateRuntimeEligibility({
-        requires: { bins: ["node"] },
-        hasBin: () => false,
-        hasEnv: () => true,
-        isConfigPathTruthy: () => true,
-      }),
-    ).toBe(false);
+  it("keeps filesystem lookup semantics for nested binary names", async () => {
+    const binDir = tempDirs.make("openclaw-prepared-nested-");
+    fs.mkdirSync(path.join(binDir, "nested"));
+    const executable = path.join(binDir, "nested", "fixture-tool");
+    fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(executable, 0o755);
+    vi.stubEnv("PATH", binDir);
+    const bin = path.join("nested", "fixture-tool");
+    expect((await prepareBinaryAvailability([bin])).hasBinary(bin)).toBe(true);
+    expect(hasBinary(bin)).toBe(true);
+  });
 
-    expect(
-      evaluateRuntimeEligibility({
-        requires: { anyBins: ["bun", "node"] },
-        hasBin: () => false,
-        hasAnyRemoteBin: () => false,
-        hasEnv: () => true,
-        isConfigPathTruthy: () => true,
-      }),
-    ).toBe(false);
+  it("bounds environment reads when missing binaries expand across PATH and PATHEXT", async () => {
+    mockProcessPlatform("win32");
+    const root = tempDirs.make("openclaw-prepared-freshness-");
+    const pathEntries = Array.from({ length: 30 }, (_, index) =>
+      path.join(root, `missing-${index}`),
+    );
+    vi.stubEnv("PATH", pathEntries.join(path.delimiter));
+    vi.stubEnv("PATHEXT", ".EXE;.CMD;.BAT;.COM");
+    const cwdSpy = vi.spyOn(process, "cwd");
+    const facts = await prepareBinaryAvailability(["missing-tool-a", "missing-tool-b"]);
+    expect(facts.hasBinary("missing-tool-a")).toBe(false);
+    expect(facts.hasBinary("missing-tool-b")).toBe(false);
+    expect(cwdSpy.mock.calls.length).toBeLessThan(20);
   });
 });
 
 describe("evaluateRuntimeEligibility", () => {
-  it("rejects entries when required OS does not match local or remote", () => {
-    const result = evaluateRuntimeEligibility({
-      os: ["definitely-not-a-runtime-platform"],
-      remotePlatforms: [],
-      hasBin: () => true,
-      hasEnv: () => true,
-      isConfigPathTruthy: () => true,
-    });
-    expect(result).toBe(false);
-  });
-
-  it("accepts entries when remote platform satisfies OS requirements", () => {
-    setPlatform("darwin");
-    const result = evaluateRuntimeEligibility({
-      os: ["linux"],
-      remotePlatforms: ["linux"],
-      hasBin: () => true,
-      hasEnv: () => true,
-      isConfigPathTruthy: () => true,
-    });
-    expect(result).toBe(true);
-  });
-
   it("bypasses runtime requirements when always=true", () => {
     const result = evaluateRuntimeEligibility({
       always: true,

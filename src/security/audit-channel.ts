@@ -1,7 +1,8 @@
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-// Audits channel configuration for exposure, auth, and trust risks.
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { AgentSelectionRequiredError } from "../agents/agent-scope-config.js";
+import { resolveChannelAccount, resolvePluginDmPolicy } from "../channels/account-resolution.js";
 import {
   hasConfiguredUnavailableCredentialStatus,
   hasResolvedCredentialValue,
@@ -9,20 +10,21 @@ import {
 import { parseAccessGroupAllowFromEntry } from "../channels/allow-from.js";
 import { resolveDmAllowAuditState } from "../channels/message-access/dm-allow-state.js";
 import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
-import type { ChannelPlugin } from "../channels/plugins/types.plugin.js";
+import type { AnyChannelPlugin as ChannelPlugin } from "../channels/plugins/types.plugin.js";
 import type { ChannelId } from "../channels/plugins/types.public.js";
 import { inspectReadOnlyChannelAccount } from "../channels/read-only-account-inspect.js";
 import { isDangerousNameMatchingEnabled } from "../config/dangerous-name-matching.js";
 import { canonicalizeMainSessionAlias } from "../config/sessions/main-session.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { parseToolsBySenderTypedKey } from "../config/types.tools.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import {
   listExactDirectMessageBindingPeerIds,
   resolveAgentRoute,
-  resolveUnknownDirectMessageRoute,
   type ResolvedAgentRoute,
 } from "../routing/resolve-route.js";
 import { parseSessionDeliveryRoute, resolveLinkedDirectPeerId } from "../routing/session-key.js";
+import { dedupeByKey } from "../shared/dedupe-by-key.js";
 import type { SecurityAuditFinding } from "./audit.types.js";
 
 type DmPrincipalRoute = {
@@ -31,24 +33,35 @@ type DmPrincipalRoute = {
   bucketKey: string;
 };
 
-function dedupeFindings(findings: SecurityAuditFinding[]): SecurityAuditFinding[] {
-  const seen = new Set<string>();
-  const out: SecurityAuditFinding[] = [];
-  for (const finding of findings) {
-    const key = [
-      finding.checkId,
-      finding.severity,
-      finding.title,
-      finding.detail ?? "",
-      finding.remediation ?? "",
-    ].join("\n");
-    if (seen.has(key)) {
+/** Finds toolsBySender keys that only match mutable sender attributes. */
+function* mutableToolsBySenderKeys(
+  value: unknown,
+  path: string,
+  isAccountRoot = true,
+): Generator<{ path: string; key: string }> {
+  const record = asNullableRecord(value);
+  if (!record) {
+    return;
+  }
+  for (const [key, child] of Object.entries(record)) {
+    if (key === "toolsBySender") {
+      const policies = asNullableRecord(child);
+      for (const senderKey of Object.keys(policies ?? {})) {
+        const typed = parseToolsBySenderTypedKey(senderKey);
+        if (typed?.type === "name" || typed?.type === "username") {
+          yield { path: `${path}.toolsBySender`, key: typed.type };
+        }
+      }
       continue;
     }
-    seen.add(key);
-    out.push(finding);
+    // Top-level `accounts` maps are audited separately per account; nested
+    // room/channel entries literally named "accounts" (e.g. channels.slack.channels.accounts)
+    // are normal policy scopes and must still be traversed.
+    if (isAccountRoot && key === "accounts") {
+      continue;
+    }
+    yield* mutableToolsBySenderKeys(child, `${path}.${key}`, false);
   }
-  return out;
 }
 
 function hasExplicitProviderAccountConfig(
@@ -67,17 +80,6 @@ function hasExplicitProviderAccountConfig(
   return Object.hasOwn(accounts, accountId);
 }
 
-function formatChannelAccountNote(params: {
-  orderedAccountIds: string[];
-  hasExplicitAccountPath: boolean;
-  accountId: string;
-}): string {
-  return params.orderedAccountIds.length > 1 || params.hasExplicitAccountPath
-    ? ` (account: ${params.accountId})`
-    : "";
-}
-
-/** Collect channel-specific security findings across active channel plugins/accounts. */
 export async function collectChannelSecurityFindingsCore(params: {
   cfg: OpenClawConfig;
   sourceConfig?: OpenClawConfig;
@@ -156,7 +158,7 @@ export async function collectChannelSecurityFindingsCore(params: {
     let resolvedAccount = resolvedInspectedAccount;
     if (!resolvedAccount) {
       try {
-        resolvedAccount = plugin.config.resolveAccount(params.cfg, accountId);
+        resolvedAccount = await resolveChannelAccount({ plugin, cfg: params.cfg, accountId });
       } catch (error) {
         diagnostics.push(
           `${plugin.id}:${accountId}: failed to resolve account (${formatErrorMessage(error)}).`,
@@ -261,7 +263,7 @@ export async function collectChannelSecurityFindingsCore(params: {
         severity: "critical",
         title: `${input.label} DMs are open`,
         detail: `${policyPath}="open" allows anyone to DM the bot.`,
-        remediation: `Use pairing/allowlist; if you really need open DMs, ensure ${allowFromKey} includes "*".`,
+        remediation: `Use pairing/allowlist; if you really need open DMs, check that ${allowFromKey} includes "*".`,
       });
       if (!hasWildcard) {
         findings.push({
@@ -324,29 +326,48 @@ export async function collectChannelSecurityFindingsCore(params: {
           title: `[secrets] ${plugin.meta.label ?? plugin.id} account could not be fully resolved`,
           detail: diagnostic,
           remediation:
-            "Ensure referenced secrets are available in this shell or run with a running gateway snapshot so security audit can inspect the full channel configuration.",
+            "Make the referenced secrets available in this shell or run with a running gateway snapshot so security audit can inspect the full channel configuration.",
         });
       }
-      if (!enabled) {
-        continue;
-      }
-      if (!configured) {
+      if (!enabled || !configured) {
         continue;
       }
 
-      const accountNote = formatChannelAccountNote({
-        orderedAccountIds,
-        hasExplicitAccountPath,
-        accountId,
-      });
-      const accountConfig = (account as { config?: Record<string, unknown> } | null | undefined)
-        ?.config;
-      const dmPolicy = plugin.security.resolveDmPolicy?.({
+      const accountNote =
+        orderedAccountIds.length > 1 || hasExplicitAccountPath ? ` (account: ${accountId})` : "";
+      const accountConfig =
+        (account as { config?: Record<string, unknown> } | null | undefined)?.config ??
+        asNullableRecord(account);
+      const dmPolicy = await resolvePluginDmPolicy({
+        plugin,
         cfg: params.cfg,
         accountId,
         account,
       });
       const nameMatchingEnabled = isDangerousNameMatchingEnabled(accountConfig);
+      const mutableToolKeys = [
+        ...mutableToolsBySenderKeys(
+          accountConfig,
+          hasExplicitAccountPath
+            ? `channels.${plugin.id}.accounts.${accountId}`
+            : `channels.${plugin.id}`,
+        ),
+      ];
+      if (mutableToolKeys.length > 0) {
+        const uniqueScopes = [...new Set(mutableToolKeys.map((entry) => entry.path))];
+        findings.push({
+          checkId: `channels.${plugin.id}.toolsBySender.mutable_entries`,
+          severity: "warn",
+          title: `${plugin.meta.label ?? plugin.id} toolsBySender uses mutable sender keys${accountNote}`,
+          detail: `${mutableToolKeys.length} toolsBySender ${mutableToolKeys.length === 1 ? "entry" : "entries"} in ${uniqueScopes
+            .slice(0, 3)
+            .join(
+              ", ",
+            )}${uniqueScopes.length > 3 ? ", …" : ""} match mutable username:/name: sender attributes. Because group members can change their display names or handles, another sender could select that tool policy override.`,
+          remediation:
+            "Prefer stable id: keys in toolsBySender, especially for entries that grant extra tools or override group deny rules.",
+        });
+      }
       const configuredEntries = (dmPolicy?.allowFrom ?? [])
         .map(String)
         .filter((raw) => raw.trim() !== "*");
@@ -405,44 +426,62 @@ export async function collectChannelSecurityFindingsCore(params: {
                 })
               : []),
           ]);
-          for (const principalId of admittedPrincipals) {
-            const principalContext = { cfg: params.cfg, accountId, account, principalId };
+          // Missing ownership is an audit finding, not an execution request. Keep
+          // checking bound principals and sibling accounts without inventing a route.
+          for (const principalId of [
+            ...admittedPrincipals,
+            ...(auditState.hasWildcard ? [undefined] : []),
+          ]) {
+            const principalContext = {
+              cfg: params.cfg,
+              accountId,
+              account,
+              ...(principalId === undefined ? {} : { principalId }),
+            };
             const channelDmScope = dmRouting?.resolveDmScope?.(principalContext);
-            const route = resolveAgentRoute({
-              cfg: params.cfg,
-              channel: plugin.id,
-              accountId,
-              peer: { kind: "direct", id: principalId },
-              dmScope: channelDmScope,
-            });
+            let route: ResolvedAgentRoute;
+            try {
+              route = resolveAgentRoute({
+                cfg: params.cfg,
+                channel: plugin.id,
+                accountId,
+                peer: { kind: "direct", id: principalId ?? "" },
+                dmScope: channelDmScope,
+              });
+            } catch (error) {
+              if (!(error instanceof AgentSelectionRequiredError)) {
+                throw error;
+              }
+              findings.push({
+                checkId: `channels.${plugin.id}.routing.owner_missing.${accountId}`,
+                severity: "warn",
+                title: `${plugin.meta.label ?? plugin.id}${accountNote} routing has no explicit owner`,
+                detail: error.message,
+                remediation: error.hint,
+              });
+              continue;
+            }
             const result = dmRouting?.resolveDmRoute?.({ ...principalContext, route });
-            const sessionKey =
-              result && "sessionKey" in result ? result.sessionKey : route.sessionKey;
-            const linkedIdentity = resolveLinkedDirectPeerId({
-              identityLinks: params.cfg.session?.identityLinks,
-              channel: plugin.id,
-              peerId: principalId,
-            });
-            recordPrincipal(
-              plugin,
-              route,
-              sessionKey,
-              linkedIdentity
-                ? `linked:${normalizeLowercaseStringOrEmpty(linkedIdentity)}`
-                : `direct:${plugin.id}:${route.accountId}:${normalizeLowercaseStringOrEmpty(principalId)}`,
-              true,
-            );
-          }
-          if (auditState.hasWildcard) {
-            const unknownContext = { cfg: params.cfg, accountId, account };
-            const route = resolveUnknownDirectMessageRoute({
-              cfg: params.cfg,
-              channel: plugin.id,
-              accountId,
-              dmScope: dmRouting?.resolveDmScope?.(unknownContext),
-            });
+            if (principalId !== undefined) {
+              const sessionKey =
+                result && "sessionKey" in result ? result.sessionKey : route.sessionKey;
+              const linkedIdentity = resolveLinkedDirectPeerId({
+                identityLinks: params.cfg.session?.identityLinks,
+                channel: plugin.id,
+                peerId: principalId,
+              });
+              recordPrincipal(
+                plugin,
+                route,
+                sessionKey,
+                linkedIdentity
+                  ? `linked:${normalizeLowercaseStringOrEmpty(linkedIdentity)}`
+                  : `direct:${plugin.id}:${route.accountId}:${normalizeLowercaseStringOrEmpty(principalId)}`,
+                true,
+              );
+              continue;
+            }
             const customRoute = dmRouting?.resolveDmRoute;
-            const result = customRoute?.({ ...unknownContext, route });
             if (customRoute && !result) {
               findings.push({
                 checkId: `channels.${plugin.id}.dm.wildcard_routing_unverified.${route.accountId}`,
@@ -498,8 +537,7 @@ export async function collectChannelSecurityFindingsCore(params: {
             findings.push(warning);
             continue;
           }
-          const message = warning;
-          const trimmed = message.trim();
+          const trimmed = warning.trim();
           if (!trimmed) {
             continue;
           }
@@ -579,5 +617,13 @@ export async function collectChannelSecurityFindingsCore(params: {
     });
   }
 
-  return dedupeFindings(findings);
+  return dedupeByKey(findings, (finding) =>
+    [
+      finding.checkId,
+      finding.severity,
+      finding.title,
+      finding.detail ?? "",
+      finding.remediation ?? "",
+    ].join("\n"),
+  );
 }

@@ -1,5 +1,5 @@
-// Memory Host SDK helper module supports batch utils behavior.
 import type { SsrFPolicy } from "./openclaw-runtime-network.js";
+import type { RemoteEmbeddingRequestAuth } from "./remote-http.js";
 
 // Common HTTP and grouping helpers for remote embedding batch clients.
 
@@ -9,6 +9,7 @@ export type BatchHttpClientConfig = {
   headers?: Record<string, string>;
   ssrfPolicy?: SsrFPolicy;
   fetchImpl?: typeof fetch;
+  resolveRequestHeaders?: RemoteEmbeddingRequestAuth;
 };
 
 /** Normalize batch API base URLs by removing one trailing slash. */
@@ -33,12 +34,6 @@ export function buildBatchHeaders(
   return headers;
 }
 
-const jsonlEncoder = new TextEncoder();
-
-function estimateJsonlLineBytes(request: unknown): number {
-  return jsonlEncoder.encode(JSON.stringify(request) ?? "").byteLength;
-}
-
 function normalizePositiveInteger(value: number | undefined): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     return undefined;
@@ -60,7 +55,7 @@ export function splitBatchRequestsByLimits<T>(
   let current: T[] = [];
   let currentBytes = 0;
   for (const request of requests) {
-    const requestBytes = estimateJsonlLineBytes(request);
+    const requestBytes = Buffer.byteLength(JSON.stringify(request) ?? "", "utf8");
     const separatorBytes = current.length === 0 ? 0 : 1;
     const wouldExceedRequests = current.length >= maxRequests;
     const wouldExceedBytes =
